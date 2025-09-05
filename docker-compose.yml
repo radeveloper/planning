@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: scrumpoker_db
+    environment:
+      POSTGRES_DB: scrumpoker
+      POSTGRES_USER: scrumpoker
+      POSTGRES_PASSWORD: scrumpoker
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+
+  redis:
+    image: redis:7-alpine
+    container_name: scrumpoker_redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+
+  api:
+    build: .
+    container_name: scrumpoker_api
+    environment:
+      DATABASE_URL: postgresql://scrumpoker:scrumpoker@db:5432/scrumpoker
+      JWT_SECRET: supersecretkey
+      JWT_EXPIRATION: 12h
+      PORT: 3000
+    depends_on:
+      - db
+      - redis
+    ports:
+      - '3000:3000'
+
+volumes:
+  db_data:
+  redis_data:

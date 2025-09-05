@@ -1,0 +1,77 @@
+// Prisma schema defining the data model for the Scrum Poker backend.
+// You can run migrations with `npm run prisma:migrate` and generate
+// the client with `npm run prisma:generate`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A room represents a Scrum Poker session. It contains metadata
+/// about the deck type, display name and settings. Each room has a
+/// short code used to join via the UI.
+model Room {
+  id           String        @id @default(uuid())
+  code         String        @unique
+  name         String
+  deckType     String
+  settings     Json          @default("{}")
+  createdAt    DateTime      @default(now())
+  participants Participant[]
+  rounds       Round[]
+}
+
+/// A participant is a user connected to a room. Participants may be
+/// designated as owners. A participant can join and leave multiple
+/// times; `leftAt` is nullable until the user leaves.
+
+model Participant {
+  id          String    @id @default(uuid())
+  room        Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId      String
+  displayName String
+  isOwner     Boolean   @default(false)
+  joinedAt    DateTime  @default(now())
+  leftAt      DateTime?
+  userId      String? // <-- EKLENDİ
+
+  votes Vote[]
+
+  @@unique([roomId, userId]) // <-- EKLENDİ (aynı user aynı odaya 2 kez giremesin)
+  @@index([roomId])
+}
+
+/// A round groups a set of votes together. Each round may be
+/// associated with an external story (e.g. Jira issue). When the
+/// voting stage ends and the values are revealed, the status field
+/// transitions accordingly.
+model Round {
+  id        String    @id @default(uuid())
+  room      Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId    String
+  storyId   String?
+  status    String // 'pending' | 'voting' | 'revealed'
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  votes     Vote[]
+}
+
+/// A vote belongs to a round and a participant. The value is stored as
+/// a string to allow different deck types (e.g. Fibonacci, T‑shirt
+/// sizes, custom labels). During the voting phase, votes are masked
+/// when sent to clients.
+model Vote {
+  id            String      @id @default(uuid())
+  round         Round       @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  roundId       String
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  participantId String
+  value         String
+  createdAt     DateTime    @default(now())
+
+  @@unique([roundId, participantId])
+}
