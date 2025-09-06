@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { randomBytes } from 'crypto';
@@ -15,7 +15,6 @@ type RoomState = {
 
 @Injectable()
 export class RoomsService {
-    private readonly logger = new Logger(RoomsService.name);
     constructor(private readonly prisma: PrismaService) {}
 
     // ---------- create / join ----------
@@ -34,22 +33,29 @@ export class RoomsService {
     }
 
     async joinRoom(code: string, displayName: string, userId?: string | null) {
-        const room = await this.prisma.room.findUnique({ where: { code } });
-        if (!room) throw new NotFoundException('Room not found');
-
-        // Aynı kullanıcı daha önce katıldıysa tekrar yaratma
-        if (userId) {
-            const existing = await this.prisma.participant.findFirst({
-                where: { roomId: room.id, userId },
+        const room = await this.getRoomByCodeOrThrow(code);
+        return this.prisma.$transaction(async (tx) => {
+            // 1) userId ile zaten katılmış mı?
+            if (userId) {
+                const byUser = await tx.participant.findFirst({ where: { roomId: room.id, userId } });
+                if (byUser) return { room, participant: byUser };
+            }
+            // 2) Aynı isimli aktif katılımcı var mı? userId boşsa bağla.
+            const byName = await tx.participant.findFirst({
+                where: { roomId: room.id, displayName, leftAt: null },
             });
-            if (existing) return { room, participant: existing };
-        }
-
-        const participant = await this.prisma.participant.create({
-            data: { roomId: room.id, displayName, userId: userId ?? null },
+            if (byName && userId && !byName.userId) {
+                const updated = await tx.participant.update({ where: { id: byName.id }, data: { userId } });
+                return { room, participant: updated };
+            }
+            // 3) Yeni oluştur
+            const participant = await tx.participant.create({
+                data: { roomId: room.id, displayName, userId: userId ?? null },
+            });
+            return { room, participant };
         });
-        return { room, participant };
     }
+
 
     async getRoomByCode(code: string) {
         const room = await this.prisma.room.findUnique({

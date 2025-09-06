@@ -1,8 +1,8 @@
-import { Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
-import { RoomsService } from './rooms.service';
-import { CreateRoomDto } from './dto/create-room.dto';
-import { JoinRoomDto } from './dto/join-room.dto';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import {Body, Controller, Get, Param, Post, Req, UseGuards} from '@nestjs/common';
+import {RoomsService} from './rooms.service';
+import {CreateRoomDto} from './dto/create-room.dto';
+import {JoinRoomDto} from './dto/join-room.dto';
+import {JwtAuthGuard} from '../auth/jwt-auth.guard';
 
 /**
  * Controller exposing REST endpoints for room management. All routes
@@ -56,8 +56,7 @@ export class RoomsController {
    */
   @Get(':code')
   async getRoom(@Param('code') code: string) {
-    const room = await this.roomsService.getRoomByCode(code);
-    return room;
+      return await this.roomsService.getRoomByCode(code);
   }
 
     @Post()
@@ -70,14 +69,13 @@ export class RoomsController {
 
     @Post(':code/join')
     async join(@Req() req, @Param('code') code: string, @Body() body: { displayName: string }) {
-        const userId = req.user?.userId ?? req.user?.sub;
+        const userId = req.user?.userId ?? req.user?.sub ?? null;
         const { room, participant } = await this.roomsService.joinRoom(code, body.displayName, userId);
         return { roomId: room.id, code: room.code, name: room.name, participantId: participant.id };
     }
 
     @Get(':code')
     async get(@Param('code') code: string) {
-        const room = await this.roomsService.getRoomByCode(code);
-        return room;
+        return await this.roomsService.getRoomByCode(code);
     }
 }
