@@ -44,21 +44,39 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
             client.disconnect(true);
         }
     }
+
     async handleDisconnect(_client: Socket) {}
 
     private roomChannel(roomId: string) {
         return `room:${roomId}`;
     }
 
+    /**
+     * Oda durumunu (snapshot) tüm odaya yayınlar ve state'i döner.
+     * Owner dahil herkes aynı 'room_state' event'ini alır.
+     */
+    private async emitRoomStateByCode(code: string) {
+        const state = await this.rooms.buildStateByCode(code);
+        const channel = this.roomChannel(state.room.id);
+        this.server.to(channel).emit('room_state', state);
+        return state;
+    }
+
     @SubscribeMessage('join_room')
-    async onJoinRoom(@MessageBody() body: { code?: string }, @ConnectedSocket() client: Socket) {
-        const code = body?.code ?? client.data.code; // fallback
-        if (!code) return client.emit('error', { code: 'BAD_REQUEST', message: 'code required' });
+    async onJoinRoom(
+        @MessageBody() body: { code?: string },
+        @ConnectedSocket() client: Socket,
+    ) {
+        const code = body?.code ?? client.data.code;
+        if (!code) {
+            return client.emit('error', { code: 'BAD_REQUEST', message: 'code required' });
+        }
 
         try {
+            // Odaya dair snapshot
             const state = await this.rooms.buildStateByCode(code);
 
-            // participantId’yi displayName ile tahmin et ve sakla
+            // Sadece UI için kendi participantId'ni tahmin etmeye çalış (opsiyonel)
             let yourParticipantId: string | undefined;
             if (client.data.displayName) {
                 const me = state.participants
@@ -71,9 +89,13 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
             client.data.code = code;
             client.data.participantId = yourParticipantId;
 
-            const channel = this.roomChannel(state.room.id);
-            client.join(channel);
-            client.emit('room_state', state);
+            const channel = `room:${state.room.id}`;
+            await client.join(channel);
+
+            // Tüm odaya güncel state
+            this.server.to(channel).emit('room_state', state);
+
+            // İstemciye self bilgisi
             client.emit('participant_self', { participantId: yourParticipantId });
 
             return { ok: true, roomId: state.room.id, participantId: yourParticipantId };
@@ -83,7 +105,10 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     @SubscribeMessage('start_voting')
-    async onStartVoting(@MessageBody() body: { code?: string; storyId?: string | null }, @ConnectedSocket() client: Socket) {
+    async onStartVoting(
+        @MessageBody() body: { code?: string; storyId?: string | null },
+        @ConnectedSocket() client: Socket,
+    ) {
         const code = body?.code ?? client.data.code;
         const storyId = body?.storyId ?? null;
         const userId = client.data.userId as string;
@@ -92,8 +117,8 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
         try {
             const state = await this.rooms.startVoting(code, storyId, userId);
-            const channel = `room:${state.room.id}`;
-            client.join(channel);
+            const channel = this.roomChannel(state.room.id);
+            await client.join(channel);
             client.emit('voting_started', { round: state.round });
             this.server.to(channel).emit('room_state', state);
         } catch (e: any) {
@@ -102,18 +127,24 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     @SubscribeMessage('vote')
-    async onVote(@MessageBody() body: { code?: string; value?: string }, @ConnectedSocket() client: Socket) {
+    async onVote(
+        @MessageBody() body: { code?: string; value?: string },
+        @ConnectedSocket() client: Socket,
+    ) {
         const code = body?.code ?? client.data.code;
         const value = body?.value;
         const userId = client.data.userId as string;
+
         if (!code) return client.emit('error', { code: 'BAD_REQUEST', message: 'code required' });
         if (!userId) return client.emit('error', { code: 'UNAUTHORIZED', message: 'no user' });
-        if (typeof value !== 'string') return client.emit('error', { code: 'BAD_REQUEST', message: 'value required' });
+        if (typeof value !== 'string') {
+            return client.emit('error', { code: 'BAD_REQUEST', message: 'value required' });
+        }
 
         try {
             const state = await this.rooms.castVoteByUser(code, userId, value);
             const channel = `room:${state.room.id}`;
-            this.server.to(channel).emit('room_state', state);
+            this.server.to(channel).emit('room_state', state); // herkese güncel durum
             client.emit('vote_cast_ack', { ok: true });
         } catch (e: any) {
             client.emit('error', { code: 'VOTE_FAILED', message: e.message ?? 'vote failed' });
@@ -129,8 +160,12 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
         try {
             const state = await this.rooms.reveal(code, userId);
-            const channel = `room:${state.room.id}`;
-            this.server.to(channel).emit('revealed', { round: state.round, votes: state.votes, average: state.average });
+            const channel = this.roomChannel(state.room.id);
+            this.server.to(channel).emit('revealed', {
+                round: state.round,
+                votes: state.votes,
+                average: state.average,
+            });
             this.server.to(channel).emit('room_state', state);
         } catch (e: any) {
             client.emit('error', { code: 'REVEAL_FAILED', message: e.message ?? 'reveal failed' });
@@ -146,12 +181,11 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
         try {
             const state = await this.rooms.reset(code, userId);
-            const channel = `room:${state.room.id}`;
+            const channel = this.roomChannel(state.room.id);
             this.server.to(channel).emit('reset_done', { round: state.round });
             this.server.to(channel).emit('room_state', state);
         } catch (e: any) {
             client.emit('error', { code: 'RESET_FAILED', message: e.message ?? 'reset failed' });
         }
     }
-
 }
