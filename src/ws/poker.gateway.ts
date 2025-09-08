@@ -27,7 +27,11 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
             const token =
                 client.handshake.auth?.token ||
                 client.handshake.headers?.authorization?.replace(/^Bearer /, '');
-            if (!token) throw new Error('No token');
+            if (!token) {
+                client.emit('error', { code: 'UNAUTHORIZED', message: 'No token' });
+                client.disconnect(true);
+                return;
+            }
 
             const payload: any = await this.jwt.verifyAsync(token, {
                 secret: this.config.get<string>('JWT_SECRET'),
@@ -35,7 +39,11 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
             // userId'i payload.userId veya payload.sub'tan al
             const uid = (payload?.userId ?? payload?.sub)?.toString?.();
-            if (!uid) throw new Error('No user id in token');
+            if (!uid) {
+                client.emit('error', { code: 'UNAUTHORIZED', message: 'No user id in token' });
+                client.disconnect(true);
+                return;
+            }
 
             client.data.userId = uid;
             client.data.displayName = payload?.displayName;
@@ -49,17 +57,6 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     private roomChannel(roomId: string) {
         return `room:${roomId}`;
-    }
-
-    /**
-     * Oda durumunu (snapshot) tüm odaya yayınlar ve state'i döner.
-     * Owner dahil herkes aynı 'room_state' event'ini alır.
-     */
-    private async emitRoomStateByCode(code: string) {
-        const state = await this.rooms.buildStateByCode(code);
-        const channel = this.roomChannel(state.room.id);
-        this.server.to(channel).emit('room_state', state);
-        return state;
     }
 
     @SubscribeMessage('join_room')
@@ -82,7 +79,7 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
                 const me = state.participants
                     .slice()
                     .reverse()
-                    .find((p) => p.displayName === client.data.displayName);
+                    .find((p: { displayName: string, id: string }) => p.displayName === client.data.displayName);
                 yourParticipantId = me?.id;
             }
 
