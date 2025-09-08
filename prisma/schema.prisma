@@ -30,19 +30,20 @@ model Room {
 /// times; `leftAt` is nullable until the user leaves.
 
 model Participant {
-  id          String    @id @default(uuid())
-  room        Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  id          String  @id @default(uuid())
   roomId      String
+  room        Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId      String?
   displayName String
-  isOwner     Boolean   @default(false)
-  joinedAt    DateTime  @default(now())
-  leftAt      DateTime?
-  userId      String? // <-- EKLENDİ
+  isOwner     Boolean @default(false)
+
+  joinedAt   DateTime  @default(now())
+  leftAt     DateTime?
+  lastSeenAt DateTime  @default(now())
 
   votes Vote[]
 
-  @@unique([roomId, userId]) // <-- EKLENDİ (aynı user aynı odaya 2 kez giremesin)
-  @@index([roomId])
+  @@index([roomId, userId])
 }
 
 /// A round groups a set of votes together. Each round may be
@@ -64,14 +65,15 @@ model Round {
 /// a string to allow different deck types (e.g. Fibonacci, T‑shirt
 /// sizes, custom labels). During the voting phase, votes are masked
 /// when sent to clients.
-model Vote {
-  id            String      @id @default(uuid())
-  round         Round       @relation(fields: [roundId], references: [id], onDelete: Cascade)
-  roundId       String
-  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
-  participantId String
-  value         String
-  createdAt     DateTime    @default(now())
 
-  @@unique([roundId, participantId])
+model Vote {
+  id            String @id @default(uuid())
+  participantId String
+  roundId       String
+  value         String
+
+  participant Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  round       Round       @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  @@unique([participantId, roundId]) // <-- önerilir (upsert için)
 }

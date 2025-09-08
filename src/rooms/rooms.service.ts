@@ -1,25 +1,20 @@
-// src/rooms/rooms.service.ts
 import {
     BadRequestException,
     ForbiddenException,
     Injectable,
-    Logger,
     NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { randomBytes } from 'crypto';
-import { Prisma } from '@prisma/client'; // ✅ TransactionClient tipi için
+import { Prisma } from '@prisma/client';
 
 type Json = Record<string, any>;
+const ONLINE_GRACE_MS = 30_000;
 
 @Injectable()
 export class RoomsService {
     constructor(private readonly prisma: PrismaService) {}
-
-    /** ----------------------------------------
-     *  Public API (REST & WS)
-     *  ---------------------------------------- */
 
     /** Oda + owner participant oluşturur, owner'a userId yazar. */
     async createRoom(userId: string, displayName: string, dto: CreateRoomDto) {
@@ -40,7 +35,9 @@ export class RoomsService {
                     roomId: room.id,
                     displayName,
                     isOwner: true,
-                    userId, // ✅ kritik
+                    userId,
+                    lastSeenAt: new Date(),
+                    leftAt: null,
                 },
             });
 
@@ -48,10 +45,7 @@ export class RoomsService {
         });
     }
 
-    /**
-     * Var olan odaya userId bağlı participant ekler (veya varsa günceller).
-     * Aynı kullanıcı aynı odaya ikinci kez farklı participant olarak giremez.
-     */
+    /** Var olan odaya userId bağlı participant ekler (veya varsa günceller). */
     async joinRoom(code: string, userId: string, displayName: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
@@ -63,21 +57,97 @@ export class RoomsService {
         const participant = existing
             ? await this.prisma.participant.update({
                 where: { id: existing.id },
-                data: { displayName },
+                data: { displayName, leftAt: null, lastSeenAt: new Date() },
             })
             : await this.prisma.participant.create({
                 data: {
                     roomId: room.id,
                     displayName,
-                    userId, // ✅ kritik
+                    userId,
                     isOwner: false,
+                    lastSeenAt: new Date(),
+                    leftAt: null,
                 },
             });
 
         return { room, participant };
     }
 
-    /** Kodla odayı ve son round’u (votes dâhil) getirir. */
+    /** Bilinçli ayrılma. Owner ise devri zorunlu (başkası varsa). */
+    async leave(code: string, userId: string, transferToParticipantId?: string | null) {
+        const room = await this.prisma.room.findUnique({ where: { code } });
+        if (!room) throw new NotFoundException('Room not found');
+
+        const me = await this.getParticipantByUserOrThrow(room.id, userId);
+
+        return this.prisma.$transaction(async (tx) => {
+            if (me.isOwner) {
+                const others = await tx.participant.findMany({
+                    where: { roomId: room.id, id: { not: me.id }, leftAt: null },
+                    select: { id: true },
+                });
+                if (others.length > 0) {
+                    if (!transferToParticipantId) {
+                        throw new BadRequestException('Owner must transfer before leaving');
+                    }
+                    const ok = others.some((p) => p.id === transferToParticipantId);
+                    if (!ok) throw new BadRequestException('Invalid transferee');
+                    await tx.participant.update({
+                        where: { id: me.id },
+                        data: { isOwner: false },
+                    });
+                    await tx.participant.update({
+                        where: { id: transferToParticipantId },
+                        data: { isOwner: true },
+                    });
+                }
+            }
+
+            await tx.participant.update({
+                where: { id: me.id },
+                data: { leftAt: new Date(), lastSeenAt: new Date() },
+            });
+
+            return this.buildStateByRoomTx(tx, room.id);
+        });
+    }
+
+    /** Owner devrini tek başına yapmak isterse (ayrı endpoint/WS). */
+    async transferOwner(code: string, userId: string, toParticipantId: string) {
+        const room = await this.prisma.room.findUnique({ where: { code } });
+        if (!room) throw new NotFoundException('Room not found');
+
+        const me = await this.getParticipantByUserOrThrow(room.id, userId);
+        if (!me.isOwner) throw new ForbiddenException('Only owner can transfer');
+
+        const target = await this.prisma.participant.findFirst({
+            where: { id: toParticipantId, roomId: room.id, leftAt: null },
+        });
+        if (!target) throw new BadRequestException('Invalid target');
+
+        await this.prisma.$transaction(async (tx) => {
+            await tx.participant.update({ where: { id: me.id }, data: { isOwner: false } });
+            await tx.participant.update({ where: { id: target.id }, data: { isOwner: true } });
+        });
+
+        return this.buildStateByRoom(room.id);
+    }
+
+    /** Pasif kopmada presence yenile (leftAt dokunma). */
+    async touchPresence(code: string, userId: string) {
+        const room = await this.prisma.room.findUnique({ where: { code } });
+        if (!room) throw new NotFoundException('Room not found');
+
+        const me = await this.getParticipantByUserOrThrow(room.id, userId);
+        await this.prisma.participant.update({
+            where: { id: me.id },
+            data: { lastSeenAt: new Date() },
+        });
+
+        return this.buildStateByRoom(room.id);
+    }
+
+    /** Kodla odayı ve son round’u getirir. */
     async getRoomByCode(code: string) {
         const room = await this.prisma.room.findUnique({
             where: { code },
@@ -100,7 +170,7 @@ export class RoomsService {
         return this.normalizeState(room);
     }
 
-    /** Owner başlatır. Yeni bir "voting" round oluşturur. */
+    /** Owner başlatır. */
     async startVoting(code: string, storyId: string | null, userId: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
@@ -109,7 +179,6 @@ export class RoomsService {
         if (!actor.isOwner) throw new ForbiddenException('Only owner can start voting');
 
         return this.prisma.$transaction(async (tx) => {
-            // Eski aktif round’u kapat (varsa)
             const current = await tx.round.findFirst({
                 where: { roomId: room.id, status: { in: ['pending', 'voting'] } },
                 orderBy: { startedAt: 'desc' },
@@ -130,51 +199,41 @@ export class RoomsService {
                 },
             });
 
-            // ✅ tx içinden state
             return this.buildStateByRoomTx(tx, room.id);
         });
     }
 
-    /** User oy atar. */
+    /** Oy atar. */
     async castVoteByUser(code: string, userId: string, value: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
 
         const participant = await this.getParticipantByUserOrThrow(room.id, userId);
 
-        // Aktif voting round’u bul
         const round = await this.prisma.round.findFirst({
             where: { roomId: room.id, status: 'voting' },
             orderBy: { startedAt: 'desc' },
         });
         if (!round) throw new BadRequestException('No active voting round');
 
-        // ❗ Şemada composite unique yoksa upsert'ta where kullanamayız.
-        // Bu yüzden önce ara, varsa update; yoksa create.
+        // Vote upsert (composite unique varsa direkt upsert; yoksa manual)
         const existing = await this.prisma.vote.findFirst({
             where: { participantId: participant.id, roundId: round.id },
             select: { id: true },
         });
 
         if (existing) {
-            await this.prisma.vote.update({
-                where: { id: existing.id },
-                data: { value },
-            });
+            await this.prisma.vote.update({ where: { id: existing.id }, data: { value } });
         } else {
             await this.prisma.vote.create({
-                data: {
-                    participantId: participant.id,
-                    roundId: round.id,
-                    value,
-                },
+                data: { participantId: participant.id, roundId: round.id, value },
             });
         }
 
         return this.buildStateByRoom(room.id);
     }
 
-    /** Owner oyları açıklar. */
+    /** Reveal. */
     async reveal(code: string, userId: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
@@ -196,7 +255,7 @@ export class RoomsService {
         return this.buildStateByRoom(room.id);
     }
 
-    /** Owner yeni oylama için sıfırlar (yeni "pending" round). */
+    /** Reset. */
     async reset(code: string, userId: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
@@ -225,19 +284,14 @@ export class RoomsService {
                 },
             });
 
-            // ✅ tx içinden state
             return this.buildStateByRoomTx(tx, room.id);
         });
     }
 
-    /** ----------------------------------------
-     *  Private helpers
-     *  ---------------------------------------- */
+    /** ----------------- Private ----------------- */
 
     private async getParticipantByUserOrThrow(roomId: string, userId: string) {
-        const p = await this.prisma.participant.findFirst({
-            where: { roomId, userId },
-        });
+        const p = await this.prisma.participant.findFirst({ where: { roomId, userId } });
         if (!p) throw new NotFoundException('Participant not found for user');
         return p;
     }
@@ -258,7 +312,6 @@ export class RoomsService {
         return this.normalizeState(room);
     }
 
-    // ✅ Transaction içinden state toplama – doğru tip: Prisma.TransactionClient
     private async buildStateByRoomTx(tx: Prisma.TransactionClient, roomId: string) {
         const room = await tx.room.findUnique({
             where: { id: roomId },
@@ -276,16 +329,22 @@ export class RoomsService {
     }
 
     private normalizeState(room: any) {
+        const now = Date.now();
         const latest = room.rounds[0] ?? null;
         const votes = latest?.votes ?? [];
         const votedSet = new Set<string>(votes.map((v: any) => v.participantId));
 
-        const participants = room.participants.map((p: any) => ({
-            id: p.id,
-            displayName: p.displayName,
-            isOwner: p.isOwner,
-            hasVoted: latest?.status === 'voting' ? votedSet.has(p.id) : false,
-        }));
+        const participants = room.participants.map((p: any) => {
+            const online =
+                !p.leftAt && now - new Date(p.lastSeenAt).getTime() <= ONLINE_GRACE_MS;
+            return {
+                id: p.id,
+                displayName: p.displayName,
+                isOwner: p.isOwner,
+                hasVoted: latest?.status === 'voting' ? votedSet.has(p.id) : false,
+                isOnline: online,
+            };
+        });
 
         const state: Json = {
             room: { id: room.id, code: room.code, name: room.name, deckType: room.deckType },
@@ -307,18 +366,15 @@ export class RoomsService {
     }
 
     private computeAverage(values: string[]) {
-        const nums = values
-            .map((v) => Number(v))
-            .filter((n) => Number.isFinite(n)) as number[];
+        const nums = values.map((v) => Number(v)).filter((n) => Number.isFinite(n)) as number[];
         if (!nums.length) return null;
         const sum = nums.reduce((a, b) => a + b, 0);
         return Number((sum / nums.length).toFixed(2));
     }
 
     private async generateUniqueCode(): Promise<string> {
-        // 6 karakterlik (hex) ve benzersiz oda kodu
         for (let attempt = 0; attempt < 8; attempt++) {
-            const code = randomBytes(3).toString('hex').toUpperCase(); // 6 hex char
+            const code = randomBytes(3).toString('hex').toUpperCase();
             const existing = await this.prisma.room.findUnique({ where: { code } });
             if (!existing) return code;
         }
