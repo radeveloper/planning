@@ -354,10 +354,10 @@ export class RoomsService {
         const latest = room.rounds[0] ?? null;
         const votes = latest?.votes ?? [];
         const votedSet = new Set<string>(votes.map((v: any) => v.participantId));
+        const alive = room.participants.filter((p: any) => !p.leftAt);
 
-        const participants = room.participants.map((p: any) => {
-            const online =
-                !p.leftAt && now - new Date(p.lastSeenAt).getTime() <= ONLINE_GRACE_MS;
+        const participants = alive.map((p: any) => {
+            const online = !p.leftAt && now - new Date(p.lastSeenAt).getTime() <= ONLINE_GRACE_MS;
             return {
                 id: p.id,
                 displayName: p.displayName,
