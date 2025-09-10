@@ -10,7 +10,7 @@ import { randomBytes } from 'crypto';
 import { Prisma } from '@prisma/client';
 
 type Json = Record<string, any>;
-const ONLINE_GRACE_MS = 30_000;
+const ONLINE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS ?? 30_000);
 
 @Injectable()
 export class RoomsService {
@@ -171,6 +171,7 @@ export class RoomsService {
     }
 
     /** Owner başlatır. */
+    /** Owner başlatır. */
     async startVoting(code: string, storyId: string | null, userId: string) {
         const room = await this.prisma.room.findUnique({ where: { code } });
         if (!room) throw new NotFoundException('Room not found');
@@ -179,6 +180,23 @@ export class RoomsService {
         if (!actor.isOwner) throw new ForbiddenException('Only owner can start voting');
 
         return this.prisma.$transaction(async (tx) => {
+            // 🟢 EN AZ 2 AKTİF KATILIMCI KONTROLÜ — transaction’ın EN BAŞINDA
+            const now = new Date();
+            const minSeen = new Date(now.getTime() - ONLINE_GRACE_MS);
+
+            const activeCount = await tx.participant.count({
+                where: {
+                    roomId: room.id,
+                    leftAt: null,
+                    lastSeenAt: { gte: minSeen },
+                },
+            });
+
+            if (activeCount < 2) {
+                throw new BadRequestException('At least two participants required to start voting');
+            }
+
+            // 🟡 Mevcut pending/voting round’u arşivle
             const current = await tx.round.findFirst({
                 where: { roomId: room.id, status: { in: ['pending', 'voting'] } },
                 orderBy: { startedAt: 'desc' },
@@ -190,6 +208,7 @@ export class RoomsService {
                 });
             }
 
+            // 🟣 Yeni round’u başlat
             await tx.round.create({
                 data: {
                     roomId: room.id,
@@ -199,9 +218,11 @@ export class RoomsService {
                 },
             });
 
+            // 🔵 Güncel state’i dön
             return this.buildStateByRoomTx(tx, room.id);
         });
     }
+
 
     /** Oy atar. */
     async castVoteByUser(code: string, userId: string, value: string) {

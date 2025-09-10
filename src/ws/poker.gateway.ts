@@ -152,6 +152,7 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (!userId) return client.emit('error', {code: 'UNAUTHORIZED', message: 'no user'});
 
         try {
+            await this.rooms.touchPresence(code, userId);
             const state = await this.rooms.startVoting(code, storyId, userId);
             const channel = this.roomChannel(state.room.id);
             await client.join(channel);
@@ -178,6 +179,7 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
         }
 
         try {
+            await this.rooms.touchPresence(code, userId);
             const state = await this.rooms.castVoteByUser(code, userId, value);
             const channel = `room:${state.room.id}`;
             this.server.to(channel).emit('room_state', state); // herkese güncel durum
