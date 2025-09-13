@@ -1,13 +1,8 @@
-import {
-    BadRequestException,
-    ForbiddenException,
-    Injectable,
-    NotFoundException,
-} from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { CreateRoomDto } from './dto/create-room.dto';
-import { randomBytes } from 'crypto';
-import { Prisma } from '@prisma/client';
+import {BadRequestException, ForbiddenException, Injectable, NotFoundException,} from '@nestjs/common';
+import {PrismaService} from '../prisma/prisma.service';
+import {CreateRoomDto} from './dto/create-room.dto';
+import {randomBytes} from 'crypto';
+import {Prisma} from '@prisma/client';
 
 type Json = Record<string, any>;
 const ONLINE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS ?? 30_000);
@@ -401,4 +396,56 @@ export class RoomsService {
         }
         throw new BadRequestException('Unable to generate unique room code');
     }
+
+    async kickParticipant(code: string, userId: string, participantId: string) {
+        const room = await this.prisma.room.findUnique({ where: { code } });
+        if (!room) throw new NotFoundException('Room not found');
+
+        // Aktörü kontrol et ve owner olmadığını kontrol et
+        const actor = await this.getParticipantByUserOrThrow(room.id, userId);
+        if (!actor.isOwner) throw new ForbiddenException('Only owner can kick participants');
+        if (actor.id === participantId) {
+            throw new BadRequestException('Cannot kick yourself');
+        }
+
+        const target = await this.prisma.participant.findFirst({
+            where: { id: participantId, roomId: room.id },
+        });
+        if (!target || target.leftAt) {
+            throw new BadRequestException('Participant not found or already left');
+        }
+        if (target.isOwner) {
+            throw new BadRequestException('Cannot kick the owner');
+        }
+
+        await this.prisma.participant.update({
+            where: { id: target.id },
+            data: {
+                leftAt: new Date(),
+                lastSeenAt: new Date(),
+            },
+        });
+
+        return this.buildStateByRoom(room.id);
+    }
+
+    // İlgili kullanıcıya ait aktif participant'ı getir
+    async findParticipantByUserInRoom(code: string, userId: string) {
+        const room = await this.prisma.room.findUnique({ where: { code } });
+        if (!room) throw new NotFoundException('Room not found');
+
+        return this.prisma.participant.findFirst({
+            where: { roomId: room.id, userId, leftAt: null },
+        });
+    }
+
+// ParticipantId -> userId çöz (kick sonrasında soketi userId ile avlamak için)
+    async getUserIdByParticipantId(participantId: string) {
+        const p = await this.prisma.participant.findUnique({
+            where: { id: participantId },
+            select: { userId: true },
+        });
+        return p?.userId ?? null;
+    }
+
 }

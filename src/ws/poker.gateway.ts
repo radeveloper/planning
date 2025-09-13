@@ -86,41 +86,48 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
         @ConnectedSocket() client: Socket,
     ) {
         const code = body?.code ?? client.data.code;
+        const userId = client.data.userId as string | undefined;
+
         if (!code) {
-            return client.emit('error', {code: 'BAD_REQUEST', message: 'code required'});
+            return client.emit('error', { code: 'BAD_REQUEST', message: 'code required' });
+        }
+        if (!userId) {
+            return client.emit('error', { code: 'UNAUTHORIZED', message: 'no user' });
         }
 
         try {
-            // Odaya dair snapshot
+            // Code'u client state'e yaz ve presence güncelle
+            client.data.code = code;
+            await this.rooms.touchPresence(code, userId);
+
+            // Participant'ı DB'den KESİN olarak bul
+            const me = await this.rooms.findParticipantByUserInRoom(code, userId);
+            if (!me) {
+                return client.emit('error', { code: 'JOIN_FAILED', message: 'participant not found in room' });
+            }
+            const participantId = me.id;
+            client.data.participantId = participantId;
+
+            // Odanın güncel snapshot'ını al
             const state = await this.rooms.buildStateByCode(code);
 
-            // Sadece UI için kendi participantId'ni tahmin etmeye çalış (opsiyonel)
-            let yourParticipantId: string | undefined;
-            if (client.data.displayName) {
-                const me = state.participants
-                    .slice()
-                    .reverse()
-                    .find((p: { displayName: string, id: string }) => p.displayName === client.data.displayName);
-                yourParticipantId = me?.id;
-            }
-
-            client.data.code = code;
-            client.data.participantId = yourParticipantId;
-
-            const channel = `room:${state.room.id}`;
+            // Oda kanalına katıl
+            const channel = this.roomChannel(state.room.id);
             await client.join(channel);
 
-            // Tüm odaya güncel state
+            // Odaya güncel state yayınla
             this.server.to(channel).emit('room_state', state);
 
-            // İstemciye self bilgisi
-            client.emit('participant_self', {participantId: yourParticipantId});
+            // İstemciye kendi participant bilgisini bildir
+            client.emit('participant_self', { participantId });
 
-            return {ok: true, roomId: state.room.id, participantId: yourParticipantId};
+            // Join ACK
+            return { ok: true, roomId: state.room.id, participantId };
         } catch (e: any) {
-            client.emit('error', {code: 'JOIN_FAILED', message: e.message ?? 'join failed'});
+            client.emit('error', { code: 'JOIN_FAILED', message: e.message ?? 'join failed' });
         }
     }
+
 
     @SubscribeMessage('leave_room')
     async onLeaveRoom(@MessageBody() body: { code?: string; transferToParticipantId?: string }, @ConnectedSocket() client: Socket) {
@@ -226,4 +233,57 @@ export class PokerGateway implements OnGatewayConnection, OnGatewayDisconnect {
             client.emit('error', {code: 'RESET_FAILED', message: e.message ?? 'reset failed'});
         }
     }
+
+    @SubscribeMessage('kick_participant')
+    async onKickParticipant(
+        @MessageBody() body: { code?: string; participantId?: string },
+        @ConnectedSocket() client: Socket,
+    ) {
+        const code = body?.code ?? client.data.code;
+        const targetParticipantId = body?.participantId;
+        const userId = client.data.userId as string;
+
+        if (!code) return client.emit('error', { code: 'BAD_REQUEST', message: 'code required' });
+        if (!userId) return client.emit('error', { code: 'UNAUTHORIZED', message: 'no user' });
+        if (!targetParticipantId) return client.emit('error', { code: 'BAD_REQUEST', message: 'participantId required' });
+
+        try {
+            // 1) DB'de kick et ve state'i al
+            const state = await this.rooms.kickParticipant(code, userId, targetParticipantId);
+            const channel = `room:${state.room.id}`;
+
+            // 2) Odaya güncel state yayınla
+            this.server.to(channel).emit('room_state', state);
+
+            // 3) Hedef kullanıcının userId'sini bul
+            const targetUserId = await this.rooms.getUserIdByParticipantId(targetParticipantId);
+
+            // 4) Namespace içindeki tüm soketleri tara ve hedefi kopar
+            const sockets = await this.server.fetchSockets(); // this.server: Namespace
+            for (const s of sockets) {
+                const sData = s.data as any;
+                const sCode = sData?.code;
+                const sPid  = sData?.participantId;
+                const sUid  = sData?.userId;
+
+                // Eşleşme koşulları: aynı oda + (participantId eşitliği veya userId eşitliği)
+                const match =
+                    sCode === code && (
+                        (sPid && sPid === targetParticipantId) ||
+                        (targetUserId && sUid === targetUserId)
+                    );
+
+                if (match) {
+                    s.emit('kicked', { message: 'You have been removed from the room' });
+                    s.leave(channel);
+                    s.disconnect(true);
+                }
+            }
+            // 5) Kick ACK
+            client.emit('kick_ack', { ok: true });
+        } catch (e: any) {
+            client.emit('error', { code: 'KICK_FAILED', message: e.message ?? 'kick failed' });
+        }
+    }
+
 }
