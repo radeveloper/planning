@@ -351,7 +351,15 @@ export class RoomsService {
         const votedSet = new Set<string>(votes.map((v: any) => v.participantId));
         const alive = room.participants.filter((p: any) => !p.leftAt);
 
-        const participants = alive.map((p: any) => {
+        // Oy değerlerini participant ID'ye göre map'e çevir (revealed durumunda sıralama için)
+        const voteMap = new Map<string, string>();
+        if (latest?.status === 'revealed') {
+            votes.forEach((v: any) => {
+                voteMap.set(v.participantId, v.value);
+            });
+        }
+
+        let participants = alive.map((p: any) => {
             const online = !p.leftAt && now - new Date(p.lastSeenAt).getTime() <= ONLINE_GRACE_MS;
             return {
                 id: p.id,
@@ -361,6 +369,35 @@ export class RoomsService {
                 isOnline: online,
             };
         });
+
+        // Revealed durumunda katılımcıları oy değerine göre sırala (büyükten küçüğe)
+        if (latest?.status === 'revealed') {
+            participants = participants.sort((a, b) => {
+                const voteA = voteMap.get(a.id);
+                const voteB = voteMap.get(b.id);
+
+                // Oy vermemişleri en sona at
+                if (!voteA && !voteB) return 0;
+                if (!voteA) return 1;
+                if (!voteB) return -1;
+
+                // Sayısal değerleri parse et
+                const numA = Number(voteA);
+                const numB = Number(voteB);
+
+                // Her ikisi de sayısal ise büyükten küçüğe sırala
+                if (Number.isFinite(numA) && Number.isFinite(numB)) {
+                    return numB - numA; // büyükten küçüğe
+                }
+
+                // Sayısal olanları üste al
+                if (Number.isFinite(numA)) return -1;
+                if (Number.isFinite(numB)) return 1;
+
+                // Her ikisi de sayısal değilse alfabetik sırala
+                return voteA.localeCompare(voteB);
+            });
+        }
 
         const state: Json = {
             room: { id: room.id, code: room.code, name: room.name, deckType: room.deckType },
